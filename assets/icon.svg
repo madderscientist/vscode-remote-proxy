@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Remote Proxy</title>
+  <desc>A bright forwarding arrow steps through two open cyan and mint tunnel gates on a deep navy tile.</desc>
+  <defs>
+    <linearGradient id="background" x1="32" y1="16" x2="224" y2="256" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#173447"/>
+      <stop offset="1" stop-color="#0B1628"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="52" fill="url(#background)"/>
+  <g fill="none" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M94 64H78c-13 0-24 11-24 24v80c0 13 11 24 24 24h16" stroke="#42C8F5"/>
+    <path d="M162 64h16c13 0 24 11 24 24v80c0 13-11 24-24 24h-16" stroke="#66E4BD"/>
+  </g>
+  <g transform="translate(0 8)" fill="none" stroke="#F1FAFF" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M82 146h23c13 0 23-10 23-23s10-23 23-23h23"/>
+    <path d="m157 83 17 17-17 17"/>
+  </g>
+</svg>

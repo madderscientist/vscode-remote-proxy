@@ -1,4 +1,4 @@
-# Remote Proxy
+# [Remote Proxy](https://marketplace.visualstudio.com/items?itemName=madderscientist.remote-proxy)
 
 [Source](https://github.com/madderscientist/vscode-remote-proxy) |
 [Issues](https://github.com/madderscientist/vscode-remote-proxy/issues)
@@ -7,10 +7,14 @@ Share your local computer's network with VS Code Remote-SSH and host-networked
 Dev Containers. Proxy connections follow participating windows, not a permanent
 service.
 
-```text
-Remote application -> remote 127.0.0.1:1080 -> SSH reverse forward
-  -> local built-in HTTP proxy -> direct internet
-  OR local existing HTTP/mixed proxy, such as Clash on 7890
+```mermaid
+flowchart LR
+    App["Remote application"] --> Port["Remote 127.0.0.1:1080"]
+    Port --> SSH["SSH reverse forward"]
+    SSH -->|Built-in mode| BuiltIn["Local built-in HTTP proxy"]
+    BuiltIn --> Internet["Internet"]
+    SSH -->|Existing-proxy mode| Proxy["Local HTTP/mixed proxy<br/>e.g. Clash on 7890"]
+    Proxy --> Internet
 ```
 
 The extension runs **locally**, not on the SSH host or in the container.
@@ -103,6 +107,8 @@ In remote VS Code settings:
 }
 ```
 
+The VS Code setting applies to VS Code requests and extensions that honor it;
+it does not export proxy variables for command-line tools or every extension.
 For terminals or tools that read proxy environment variables:
 
 ```sh
@@ -115,6 +121,9 @@ export all_proxy="$ALL_PROXY"
 export NO_PROXY=localhost,127.0.0.1,::1
 export no_proxy="$NO_PROXY"
 ```
+
+For Remote-SSH, add the exports above to
+`~/.vscode-server/server-env-setup` on the remote host.
 
 For a host-networked Dev Container, put the needed variables in `remoteEnv`
 and the VS Code proxy URL in `customizations.vscode.settings.http.proxy`.
@@ -287,18 +296,18 @@ SSH config parsing, multiple leases and shutdown. An isolated Linux integration
 test needs `ssh`, `sshd` and `ssh-keygen`; it is skipped if Linux/sshd is absent.
 No test uses your existing SSH keys.
 
-Repository name: **vscode-remote-proxy**. The publisher `local-tools` is a
-development identifier; replace it with your registered publisher before
-publishing to the Marketplace.
+To release, update `version` in `package.json`, then push a matching tag such as
+`v0.1.0`. The Deploy workflow tests and builds the extension, then creates a
+GitHub Release with the VSIX attached. Push the version commit to `main` before
+pushing its tag. Marketplace publishing is manual.
+
+Repository name: **vscode-remote-proxy**. Marketplace publisher:
+`madderscientist`.
 
 ### Switching from the prototype
 
 Uninstall **Session HTTP Proxy** (`local-tools.session-http-proxy`) locally and
 remove its `sessionHttpProxy.*` user settings. Do not run both extensions:
 they may compete for the same remote port. Install **Remote Proxy**
-(`local-tools.remote-proxy`) and select the hosts again. No prototype settings,
+(`madderscientist.remote-proxy`) and select the hosts again. No prototype settings,
 passwords or storage are migrated automatically.
-
-## License
-
-MIT.

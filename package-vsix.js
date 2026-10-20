@@ -13,11 +13,14 @@ try {
   for (const file of ["package.json", "extension.js", "broker.js", "askpass.js", "ssh-config.js", "README.md", "LICENSE"]) {
     fs.copyFileSync(path.join(__dirname, file), path.join(staging, "extension", file));
   }
+  fs.mkdirSync(path.join(staging, "extension", "assets"));
+  fs.copyFileSync(path.join(__dirname, manifest.icon), path.join(staging, "extension", manifest.icon));
   fs.writeFileSync(path.join(staging, "[Content_Types].xml"), `<?xml version="1.0" encoding="utf-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="json" ContentType="application/json"/>
   <Default Extension="js" ContentType="application/javascript"/>
   <Default Extension="md" ContentType="text/markdown"/>
+  <Default Extension="png" ContentType="image/png"/>
   <Default Extension="vsixmanifest" ContentType="text/xml"/>
   <Override PartName="/extension/LICENSE" ContentType="text/plain"/>
 </Types>
@@ -37,6 +40,7 @@ try {
       <Property Id="Microsoft.VisualStudio.Code.ExecutesCode" Value="true"/>
     </Properties>
     <License>extension/LICENSE</License>
+    <Icon>extension/${manifest.icon}</Icon>
   </Metadata>
   <Installation><InstallationTarget Id="Microsoft.VisualStudio.Code"/></Installation>
   <Dependencies/>
@@ -44,6 +48,7 @@ try {
     <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/>
     <Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true"/>
     <Asset Type="Microsoft.VisualStudio.Services.Content.License" Path="extension/LICENSE" Addressable="true"/>
+    <Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="extension/${manifest.icon}" Addressable="true"/>
   </Assets>
 </PackageManifest>
 `);
