@@ -1,0 +1,90 @@
+{
+  "name": "remote-proxy",
+  "displayName": "Remote Proxy",
+  "description": "A local HTTP proxy shared by connected SSH and Dev Container windows, with no permanent service.",
+  "version": "0.1.0",
+  "publisher": "local-tools",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/madderscientist/vscode-remote-proxy.git"
+  },
+  "homepage": "https://github.com/madderscientist/vscode-remote-proxy#readme",
+  "bugs": {
+    "url": "https://github.com/madderscientist/vscode-remote-proxy/issues"
+  },
+  "keywords": ["remote-ssh", "devcontainers", "http-proxy", "ssh-tunnel", "clash"],
+  "engines": { "vscode": "^1.95.0" },
+  "categories": ["Other"],
+  "extensionKind": ["ui"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test",
+    "package": "node package-vsix.js"
+  },
+  "contributes": {
+    "commands": [
+      { "command": "remoteProxy.attach", "title": "Remote Proxy: Attach this remote window" },
+      { "command": "remoteProxy.disable", "title": "Remote Proxy: Disable for this host" },
+      { "command": "remoteProxy.configure", "title": "Remote Proxy: Configure enabled hosts" },
+      { "command": "remoteProxy.retry", "title": "Remote Proxy: Retry connection" },
+      { "command": "remoteProxy.showLog", "title": "Remote Proxy: Show log" }
+    ],
+    "configuration": {
+      "title": "Remote Proxy",
+      "properties": {
+        "remoteProxy.localProxyPort": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 65535,
+          "scope": "application",
+          "description": "0 uses the built-in direct HTTP proxy. Set an existing local HTTP/mixed proxy port (for example Clash 7890) to forward it instead. SOCKS-only ports are not supported."
+        },
+        "remoteProxy.sshConfigFile": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Optional local SSH config path. Otherwise use remote.SSH.configFile, then ~/.ssh/config. Supports ~/."
+        },
+        "remoteProxy.hosts": {
+          "type": "array",
+          "default": [],
+          "items": { "type": "string" },
+          "uniqueItems": true,
+          "scope": "application",
+          "description": "SSH Host aliases enabled for automatic proxy connections. Use exact aliases from your local SSH config, not IP-to-user mappings."
+        },
+        "remoteProxy.windowBindings": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": { "type": "string" },
+          "scope": "application",
+          "description": "Remote authorities explicitly bound using the Attach command."
+        },
+        "remoteProxy.sshPath": {
+          "type": "string",
+          "default": "ssh",
+          "scope": "application",
+          "description": "Local OpenSSH executable supporting SSH_ASKPASS_REQUIRE (OpenSSH 8.4+)."
+        },
+        "remoteProxy.authentication": {
+          "type": "string",
+          "enum": ["password", "key"],
+          "default": "password",
+          "scope": "application",
+          "description": "Password asks on each new proxy SSH connection without saving it; key uses the local SSH agent/key non-interactively."
+        },
+        "remoteProxy.remotePort": {
+          "type": "integer",
+          "default": 1080,
+          "minimum": 1024,
+          "maximum": 65535,
+          "scope": "application",
+          "description": "Remote loopback HTTP proxy port. Dev Containers must share the host network."
+        }
+      }
+    }
+  }
+}
