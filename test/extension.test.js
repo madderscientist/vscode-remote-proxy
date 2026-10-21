@@ -116,6 +116,26 @@ test("encoded Chinese SSH aliases match the enabled alias array and acquire a le
   f.dispose();
 });
 
+for (const wrapper of ["repeated-prefix", "user-prefix", "host-name"]) {
+  test(`Dev Container ${wrapper} normalizes encoded SSH aliases before acquiring a lease`, async (t) => {
+    const alias = "wifi下Unitree-G1";
+    const ssh = "ssh-remote+" + Buffer.from(JSON.stringify({ hostName: alias })).toString("hex");
+    const metadata = wrapper === "repeated-prefix"
+      ? { configFile: { authority: `ssh-remote+${ssh}` } }
+      : wrapper === "user-prefix" ? { host: `unitree@${ssh}` } : { hostName: ssh };
+    const authority = "dev-container+" + Buffer.from(JSON.stringify(metadata)).toString("hex");
+    const { sshHosts } = load({ Uri: uriApi });
+    const names = sshHosts(authority);
+    assert.ok(names.includes(alias), JSON.stringify(names));
+    assert.ok(names.every((name) => !name.startsWith("ssh-remote+")), JSON.stringify(names));
+    const f = fixture("dev-container", async () => ({}), { hosts: [alias] }, "unused", { authority });
+    t.after(() => f.dispose());
+    await settle();
+    assert.equal(f.sockets.length, 1);
+    assert.deepEqual(f.sockets[0].messages, ["ping\n"]);
+  });
+}
+
 test("only arrays of host aliases are accepted", () => {
   const { enabledHosts } = load({ Uri: uriApi });
   assert.deepEqual(enabledHosts(["robot", "other"]), ["robot", "other"]);

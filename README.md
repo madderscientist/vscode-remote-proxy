@@ -162,6 +162,26 @@ SSH configuration, or system proxy configuration. Programs must support the
 configured proxy mechanism themselves. A proxy URL remaining in settings does
 not keep a listener alive.
 
+### Dev Container window does not keep the proxy connected
+
+Check **Remote Proxy: Show log** in the **Dev Container window itself**.
+A ready message in the original SSH window does not confirm that the container
+window has joined the shared connection.
+
+If the container log says `Host not enabled` and the decoded aliases still
+contain `ssh-remote+...`, update the local extension to 0.1.1 or later.
+Nested SSH authorities must be decoded to the original SSH alias before matching
+`remoteProxy.hosts`. As an immediate workaround, run **Remote Proxy: Attach this
+remote window** in the container window and enter the enabled SSH alias exactly.
+Then retry the connection and verify it still works after closing the SSH window.
+
+Also confirm that the container's running proxy environment uses `http://`, not
+`socks5h://`, for this extension's HTTP port. Changing Compose environment values
+requires recreating the container, not just restarting it. Reopen the container
+window after changing `remoteEnv`; existing VS Code processes keep their old
+environment. Preserve any data or packages in the container's writable layer
+before recreating it.
+
 ## Settings and commands
 
 All settings are local application settings. Default Settings is read-only;
@@ -290,7 +310,7 @@ npm run package
 ```
 
 The lightweight packager needs the `zip` executable and writes
-`dist/remote-proxy-0.1.0.vsix`. It packages only runtime files, the README and
+`dist/remote-proxy-0.1.1.vsix`. It packages only runtime files, the README and
 license. Tests cover HTTP/CONNECT, passwords and cancellation, host selection,
 SSH config parsing, multiple leases and shutdown. An isolated Linux integration
 test needs `ssh`, `sshd` and `ssh-keygen`; it is skipped if Linux/sshd is absent.

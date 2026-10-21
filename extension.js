@@ -11,6 +11,10 @@ const { configPath, readHosts } = require("./ssh-config");
 
 function sshHosts(authority) {
   const found = new Set();
+  function addHost(name, depth) {
+    if (name.startsWith("ssh-remote+")) visit(name, depth + 1);
+    else found.add(name);
+  }
   function visit(value, depth = 0) {
     if (depth > 8 || value == null) return;
     if (typeof value === "object") {
@@ -18,13 +22,13 @@ function sshHosts(authority) {
     } else if (typeof value === "string") {
       if (value.startsWith("ssh-remote+")) {
         const name = value.slice("ssh-remote+".length);
-        found.add(name);
+        addHost(name, depth);
         if (/^(?:[a-fA-F0-9]{2})+$/.test(name)) visit(Buffer.from(name, "hex").toString(), depth + 1);
       }
       if (value.startsWith("dev-container+")) visit(value.slice("dev-container+".length), depth + 1);
       if (/^(?:[a-fA-F0-9]{2})+$/.test(value)) visit(Buffer.from(value, "hex").toString(), depth + 1);
       if (value.startsWith("{")) {
-        try { visit(JSON.parse(value), depth + 1); }
+        try { return visit(JSON.parse(value), depth + 1); }
         catch (error) {
           if (!(error instanceof SyntaxError)) throw error;
         }
@@ -32,9 +36,9 @@ function sshHosts(authority) {
       if (value.startsWith("vscode-remote://")) {
         visit(vscode.Uri.parse(value).authority, depth + 1);
       }
-      if (value.includes("@") && !value.includes("://")) found.add(value.split("@").pop());
+      if (value.includes("@") && !value.includes("://")) addHost(value.split("@").pop(), depth);
     }
-    if (typeof value === "object" && typeof value.hostName === "string") found.add(value.hostName);
+    if (typeof value === "object" && typeof value.hostName === "string") addHost(value.hostName, depth);
   }
   visit(authority);
   return [...found];

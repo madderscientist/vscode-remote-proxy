@@ -2,7 +2,7 @@
   "name": "remote-proxy",
   "displayName": "Remote Proxy",
   "description": "A local HTTP proxy shared by connected SSH and Dev Container windows, with no permanent service.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "madderscientist",
   "repository": {
     "type": "git",
