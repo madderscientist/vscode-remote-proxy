@@ -158,6 +158,6 @@ test(`real OpenSSH forwarding (${useLocalProxy ? "existing local proxy" : "built
     socket.on("connect", () => { socket.destroy(); resolve(); });
     socket.on("error", reject);
   }), /ECONNREFUSED/);
-  assert.equal(messages.length, 0);
+  assert.deepEqual(messages.filter((message) => !/^(Window lease |Stopping broker:)/.test(message)), []);
 });
 }

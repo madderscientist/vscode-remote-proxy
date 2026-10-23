@@ -7,14 +7,19 @@ Share your local computer's network with VS Code Remote-SSH and host-networked
 Dev Containers. Proxy connections follow participating windows, not a permanent
 service.
 
-```mermaid
-flowchart LR
-    App["Remote application"] --> Port["Remote 127.0.0.1:1080"]
-    Port --> SSH["SSH reverse forward"]
-    SSH -->|Built-in mode| BuiltIn["Local built-in HTTP proxy"]
-    BuiltIn --> Internet["Internet"]
-    SSH -->|Existing-proxy mode| Proxy["Local HTTP/mixed proxy<br/>e.g. Clash on 7890"]
-    Proxy --> Internet
+```text
+Remote application
+  |
+  v
+Remote 127.0.0.1:1080 (HTTP)
+  |
+  v
+SSH reverse forward to the local computer
+  |
+  +-- Built-in mode ------> Built-in HTTP proxy ------> Internet
+  |
+  +-- Existing-proxy mode -> Local HTTP/mixed proxy --> Internet
+                            (e.g. Clash on 7890)
 ```
 
 The extension runs **locally**, not on the SSH host or in the container.
@@ -182,6 +187,69 @@ window after changing `remoteEnv`; existing VS Code processes keep their old
 environment. Preserve any data or packages in the container's writable layer
 before recreating it.
 
+### Cannot start the local broker / another broker is already running
+
+Version 0.1.2 fixes the shutdown/reconnect startup race described below.
+
+The extension reuses a running broker. During shutdown, its control channel
+closes before SSH exits and the lock is released. Startup waits for lock
+conflicts within a bounded 10-second window, checking for a broker started by
+another window without repeatedly launching children while the locks remain.
+Other startup failures are reported promptly. A failure or timeout requires
+explicit **Retry connection**; rapid Retry cancels obsolete startup attempts.
+
+If the failure persists, close all participating Remote-SSH and Dev Container
+windows. Check the PID in `broker.lock` and its process command line before
+stopping anything: a live PID alone does not prove it is this extension's broker.
+Only after confirming that no broker is running or starting, remove stale
+`broker.lock` / `broker-starting.lock` files from the specific local global-storage
+directory named in the error, reopen a remote window and retry. Do not delete
+locks belonging to a live broker or terminate unrelated VS Code processes.
+A live PID is not proof of a healthy broker. The extension does not kill it or
+steal its lock when the control channel is unavailable. Stale startup guards
+and locks pointing at reused PIDs require the same ownership checks.
+
+`broker.log` is appended across launches. `HTTP request failed`, `CONNECT failed`
+and `Client connection failed` entries describe individual proxy requests, not
+necessarily the latest startup failure. New broker entries include an ISO
+timestamp and `[broker PID]`, with startup, control-listening and shutdown
+markers. Use those to separate instances; older unmarked entries cannot be
+reliably attributed to a particular attempt. For example,
+`ENETUNREACH 169.254.169.254:80` means a request to a link-local address (commonly
+used for cloud instance metadata) could not be reached from the local computer.
+Such requests generally need to bypass the proxy and run on the remote host.
+For tools that honor proxy environment variables, include `169.254.169.254` in
+both `NO_PROXY` and `no_proxy`, preserving existing exclusions. Connection resets
+alone do not identify a startup failure; check the last broker error separately.
+
+For CONNECT upstream failures, the log includes the destination host/port,
+whether TCP establishment had completed (`connect` or `tunnel` phase), elapsed
+milliseconds and the error code. No request headers, URL paths or tunnel payloads
+are included. A reset after establishment can come from the destination or an
+intermediary; it does not by itself mean the proxy SSH disconnected. Failed
+tunnels are closed individually, without replaying their traffic or closing
+other tunnels. Older entries without destination/phase details cannot be
+retroactively attributed to a particular service.
+
+### Proxy disconnects after it was ready
+
+Version 0.1.2 separates local heartbeats from remote filesystem checks so a slow
+check cannot expire a responsive window's lease. A late check also cannot
+reconnect after its control channel closes. See **Lifecycle and authentication**
+below for the connection policy.
+
+`broker.log` records numbered window leases, heartbeat expiry ages, remaining
+window counts and shutdown reasons. **Remote Proxy: Show log** records
+control-channel releases (Retry, configuration changes or disposal) and the
+last heartbeat age. Remote checks taking at least 2 seconds are logged on
+completion; a check still pending after 5 seconds logs once. Use these entries
+to distinguish heartbeat expiry, window closure and SSH failure.
+
+These diagnostics omit passwords, authentication tokens and workspace paths.
+Installing updated files does not update an already-running broker:
+close participating remote windows, allow the old broker to exit normally,
+then reload and reconnect with the new extension.
+
 ## Settings and commands
 
 All settings are local application settings. Default Settings is read-only;
@@ -217,18 +285,22 @@ execute `Match exec`. Re-run the picker after editing the config.
 ## Lifecycle and authentication
 
 VS Code windows using the same local extension storage, SSH alias and proxy
-settings share a local
-broker and one SSH connection. A remote filesystem probe renews each window's
-lease every 2 seconds. Closing the last window stops the broker's proxy and SSH
-child. Only extension-owned processes are terminated.
+settings share a local broker and one SSH connection. After an initial remote
+filesystem check succeeds, each window renews its lease every 2 seconds
+independently of subsequent checks. Closing the last window stops the broker's
+proxy and SSH child. Only extension-owned processes are terminated.
 
 Different aliases for the same remote machine are not automatically merged.
 Different settings, local profiles or local computers can create separate
 brokers that compete for the same remote port. An occupied port is reported
 as an error; no existing listener is killed or taken over.
 
-A hung/disconnected window's lease expires after 10 seconds without successful
-remote I/O, checked every second: approximately 11 seconds of detection delay.
+A window's lease expires after 10 seconds without a local heartbeat, checked
+every second: approximately 11 seconds of detection delay. An explicit remote
+filesystem error releases the lease. Only one check is in flight per connection
+generation; a pending check does not block heartbeats. If it never returns while
+the window and proxy SSH remain alive, the proxy stays connected until an
+explicit failure, window closure or disable command.
 After a broker connection closes, use **Retry connection** or reopen the window.
 An unclaimed broker exits after 15 seconds. The extension does not keep
 containers alive or stop them; the container's own shutdown policy applies.
@@ -309,17 +381,31 @@ npm test
 npm run package
 ```
 
-The lightweight packager needs the `zip` executable and writes
-`dist/remote-proxy-0.1.1.vsix`. It packages only runtime files, the README and
-license. Tests cover HTTP/CONNECT, passwords and cancellation, host selection,
-SSH config parsing, multiple leases and shutdown. An isolated Linux integration
-test needs `ssh`, `sshd` and `ssh-keygen`; it is skipped if Linux/sshd is absent.
-No test uses your existing SSH keys.
+The lightweight packager uses Windows PowerShell's built-in .NET ZIP support
+on Windows and the `zip` executable elsewhere. It writes
+`dist/remote-proxy-0.1.2.vsix`. It packages only runtime files, the README and
+license. Tests cover HTTP/CONNECT, password validation and cancellation, host
+selection, SSH config parsing, control-channel failures, multiple leases and
+shutdown without stopping an external proxy. Process-level lifecycle tests
+use real broker children and control connections (Windows named pipes or Unix
+sockets), with a controlled SSH worker to reproduce shutdown/Retry races and
+verify that a stalled remote check cannot expire a responsive window's lease.
+They use isolated temporary storage, not VS Code's real locks. The Linux
+integration tests need `ssh`, `sshd` and `ssh-keygen`; they are skipped if
+Linux/sshd is absent. No test uses your existing SSH keys.
 
-To release, update `version` in `package.json`, then push a matching tag such as
-`v0.1.0`. The Deploy workflow tests and builds the extension, then creates a
-GitHub Release with the VSIX attached. Push the version commit to `main` before
-pushing its tag. Marketplace publishing is manual.
+To release, set `version` in `package.json` without a `v` prefix (for example,
+`0.1.2`). Commit and push the changes to `main`, then create and push the matching
+Git tag:
+
+```sh
+git tag -a v0.1.2 -m "Release v0.1.2"
+git push origin v0.1.2
+```
+
+The Deploy workflow runs on pushed `v*` tags, tests and builds the extension,
+then creates a GitHub Release with the VSIX attached. Marketplace publishing is
+manual. Do not move an existing release tag.
 
 Repository name: **vscode-remote-proxy**. Marketplace publisher:
 `madderscientist`.

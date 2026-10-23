@@ -8,8 +8,9 @@ const path = require("node:path");
 const http = require("node:http");
 const net = require("node:net");
 const { spawn } = require("node:child_process");
-const { once } = require("node:events");
-const { createProxy, startBroker, endpoint, validHost } = require("../broker");
+const { once, EventEmitter } = require("node:events");
+const { PassThrough } = require("node:stream");
+const { createProxy, startBroker, endpoint, validHost, validPassword } = require("../broker");
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const listen = (server) => new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -74,6 +75,66 @@ test("CONNECT tunnels both directions including bytes after the request headers"
   assert.match(received, /^HTTP\/1.1 200 Connection Established\r\n\r\nhello$/);
 });
 
+test("an upstream CONNECT reset is diagnosed without closing other tunnels or logging credentials", async (t) => {
+  const messages = [];
+  const proxy = createProxy((message) => messages.push(message));
+  const reset = net.createServer((socket) => socket.once("data", () => socket.resetAndDestroy()));
+  const echo = net.createServer((socket) => socket.pipe(socket));
+  await listen(reset);
+  await listen(echo);
+  await listen(proxy.server);
+  const clients = [];
+  t.after(async () => {
+    for (const client of clients) client.destroy();
+    await proxy.close();
+    await close(reset);
+    await close(echo);
+  });
+  async function tunnel(port) {
+    const client = net.connect(proxy.server.address().port, "127.0.0.1");
+    clients.push(client);
+    client.on("error", () => {});
+    const response = deadline(once(client, "data"));
+    client.write(`CONNECT 127.0.0.1:${port} HTTP/1.1\r\nHost: target\r\nProxy-Authorization: test-secret-header\r\n\r\n`);
+    const [data] = await response;
+    assert.equal(data.toString(), "HTTP/1.1 200 Connection Established\r\n\r\n");
+    return client;
+  }
+  const healthy = await tunnel(echo.address().port);
+  const broken = await tunnel(reset.address().port);
+  const brokenClosed = deadline(once(broken, "close"));
+  broken.write("test-payload-not-for-logging");
+  await brokenClosed;
+  assert.equal(healthy.destroyed, false);
+  const received = deadline(once(healthy, "data"));
+  healthy.write("still-connected");
+  assert.equal((await received)[0].toString(), "still-connected");
+  const diagnostic = messages.find((message) => message.startsWith("CONNECT failed:"));
+  assert.match(diagnostic, /code=ECONNRESET/);
+  assert.ok(diagnostic.includes(`target=127.0.0.1:${reset.address().port}`));
+  assert.match(diagnostic, /phase=tunnel; elapsed=\d+ms/);
+  assert.ok(!messages.join("\n").includes("test-secret-header"));
+  assert.ok(!messages.join("\n").includes("test-payload-not-for-logging"));
+});
+
+test("a CONNECT failure before upstream establishment reports the connect phase and returns 502", async (t) => {
+  const messages = [];
+  const proxy = createProxy((message) => messages.push(message));
+  const unused = net.createServer();
+  await listen(unused);
+  const port = unused.address().port;
+  await close(unused);
+  await listen(proxy.server);
+  const client = net.connect(proxy.server.address().port, "127.0.0.1");
+  t.after(async () => { client.destroy(); await proxy.close(); });
+  const response = deadline(once(client, "data"));
+  client.write(`CONNECT 127.0.0.1:${port} HTTP/1.1\r\nHost: target\r\n\r\n`);
+  assert.match((await response)[0].toString(), /^HTTP\/1.1 502 Bad Gateway/);
+  const diagnostic = messages.find((message) => message.startsWith("CONNECT failed:"));
+  assert.ok(diagnostic.includes(`target=127.0.0.1:${port}`));
+  assert.match(diagnostic, /phase=connect; elapsed=\d+ms; code=ECONNREFUSED/);
+});
+
 test("invalid HTTP requests and unreachable upstreams produce explicit errors", async (t) => {
   const messages = [];
   const proxy = createProxy((message) => messages.push(message));
@@ -132,7 +193,7 @@ async function clientFor(broker) {
 }
 
 test("SSH and container windows share one broker; closing the SSH window preserves the container lease", async (t) => {
-  const { broker, stateDir } = await brokerFixture(t);
+  const { broker, stateDir, messages } = await brokerFixture(t);
   const sshWindow = await clientFor(broker);
   const containerWindow = await clientFor(broker);
   t.after(() => { sshWindow.destroy(); containerWindow.destroy(); });
@@ -143,18 +204,24 @@ test("SSH and container windows share one broker; closing the SSH window preserv
   containerWindow.write("ping\n");
   containerWindow.destroy();
   await deadline(broker.closed);
+  assert.ok(messages.some((message) => message.includes("Stopping broker: last window disconnected")));
+  assert.ok(!messages.some((message) => message.includes("expired")));
   assert.equal(fs.existsSync(path.join(stateDir, "broker.lock")), false);
   if (process.platform !== "win32") assert.equal(fs.existsSync(endpoint(stateDir)), false);
 });
 
 test("a disconnected or hung window loses its lease even if its control socket stays open", async (t) => {
-  const { broker } = await brokerFixture(t);
+  const { broker, messages } = await brokerFixture(t);
   const socket = await clientFor(broker);
   t.after(() => socket.destroy());
   const start = Date.now();
   await deadline(broker.closed, 2000);
   assert.ok(Date.now() - start >= 250);
   assert.ok(Date.now() - start < 1500);
+  const expired = messages.find((message) => message.includes("expired; heartbeat age="));
+  assert.match(expired, /Window lease 1 expired; heartbeat age=\d+ms; limit=300ms; windows=1/);
+  assert.ok(Number(expired.match(/age=(\d+)ms/)[1]) > 300);
+  assert.ok(messages.some((message) => message.includes("Stopping broker: last window lease expired")));
 });
 
 test("a healthy second window survives expiration of the disconnected first window", async (t) => {
@@ -194,8 +261,10 @@ test("missing SSH executable fails without leaving a broker running", async (t) 
 });
 
 test("an unclaimed broker exits rather than remaining in the background", async (t) => {
-  const { broker } = await brokerFixture(t, { startupGraceMs: 200 });
+  const { broker, messages } = await brokerFixture(t, { startupGraceMs: 200 });
   await deadline(broker.closed);
+  assert.ok(messages.some((message) => message.includes("Stopping broker: error; windows=0")));
+  assert.ok(messages.some((message) => message.includes("No VS Code window acquired")));
 });
 
 test("another broker cannot replace a running broker's socket or lock", async (t) => {
@@ -204,9 +273,83 @@ test("another broker cannot replace a running broker's socket or lock", async (t
   t.after(() => socket.destroy());
   await assert.rejects(startBroker({
     stateDir, host: "developer@192.0.2.10", sshFactory: fakeSsh
-  }), /already running/);
+  }), { code: "EBROKERBUSY", message: /already running/ });
   assert.equal(socket.destroyed, false);
 });
+
+test("an occupied Windows control pipe reports the listen error and releases only its own lock", {
+  skip: process.platform !== "win32"
+}, async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "remote-proxy-pipe-test-"));
+  const occupied = net.createServer((socket) => socket.end());
+  t.after(async () => {
+    await close(occupied);
+    fs.rmSync(stateDir, { recursive: true });
+  });
+  await once(occupied.listen(endpoint(stateDir)), "listening");
+  const messages = [];
+  await assert.rejects(startBroker({
+    stateDir, host: "lab", report: (message) => messages.push(message),
+    sshFactory() { assert.fail("SSH must not start when the control pipe is occupied"); }
+  }), { code: "EADDRINUSE" });
+  assert.ok(messages.some((message) => message.includes("EADDRINUSE")));
+  assert.equal(fs.existsSync(path.join(stateDir, "broker.lock")), false);
+  assert.equal(fs.existsSync(path.join(stateDir, "broker-starting.lock")), false);
+  const client = net.connect(endpoint(stateDir));
+  t.after(() => client.destroy());
+  await once(client, "connect");
+  client.destroy();
+});
+
+test("a shutting-down broker keeps its lock after closing its control channel until SSH exits", async (t) => {
+  const ssh = new EventEmitter();
+  ssh.pid = process.pid;
+  ssh.exitCode = null;
+  ssh.signalCode = null;
+  ssh.stdin = new PassThrough();
+  ssh.stdout = new PassThrough();
+  ssh.stderr = new PassThrough();
+  let killed;
+  const terminationRequested = new Promise((resolve) => { killed = resolve; });
+  ssh.kill = () => { killed(); return true; };
+  const { broker, stateDir } = await brokerFixture(t, { sshFactory: () => ssh });
+  const stopping = broker.stop();
+  try {
+    await deadline(terminationRequested);
+    const socket = net.connect(broker.address);
+    t.after(() => socket.destroy());
+    await assert.rejects(once(socket, "connect"),
+      (error) => ["ENOENT", "ECONNREFUSED"].includes(error.code));
+    assert.ok(fs.existsSync(path.join(stateDir, "broker.lock")));
+    await assert.rejects(startBroker({
+      stateDir, host: "developer@192.0.2.10", sshFactory: fakeSsh
+    }), { code: "EBROKERBUSY" });
+  } finally {
+    ssh.exitCode = 0;
+    ssh.emit("exit", 0, null);
+    await deadline(stopping);
+  }
+  assert.equal(fs.existsSync(path.join(stateDir, "broker.lock")), false);
+});
+
+for (const lock of ["broker.lock", "broker-starting.lock"]) {
+  test(`broker subprocess reports retryable contention for ${lock} without changing it`, async (t) => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "remote-proxy-lock-test-"));
+    t.after(() => fs.rmSync(stateDir, { recursive: true }));
+    const lockPath = path.join(stateDir, lock);
+    const contents = String(process.pid);
+    fs.writeFileSync(lockPath, contents);
+    const child = spawn(process.execPath, [
+      path.resolve(__dirname, "../broker.js"), JSON.stringify({ stateDir, host: "lab" })
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (data) => { stderr += data; });
+    const [code] = await once(child, "exit");
+    assert.equal(code, 75, stderr);
+    assert.match(stderr, /Another broker is/);
+    assert.equal(fs.readFileSync(lockPath, "utf8"), contents);
+  });
+}
 
 test("SSH destinations cannot inject command-line options", () => {
   assert.equal(validHost("developer@192.0.2.10"), true);
@@ -217,12 +360,22 @@ test("SSH destinations cannot inject command-line options", () => {
   assert.equal(validHost("host\ncommand"), false);
 });
 
+test("password validation preserves length limits and rejects non-string or multiline values", () => {
+  for (const value of ["", "test-password", "x".repeat(8192)]) {
+    assert.equal(validPassword(value), true);
+  }
+  for (const value of [null, undefined, 123, {}, "line\nbreak", "line\rbreak", "null\0byte", "x".repeat(8193)]) {
+    assert.equal(validPassword(value), false);
+  }
+});
+
 test("SSH output after startup does not send duplicate ready notifications", async (t) => {
   let ssh;
   const { broker } = await brokerFixture(t, {
     sshFactory: (command, args, options) => {
       ssh = spawn(process.execPath, ["-e",
-        "process.stdin.on('data',()=>process.stdout.write('REMOTE_PROXY_READY\\n'));"
+        "process.stdin.on('data',()=>{process.stdout.write('REMOTE_PROXY_');" +
+        "setTimeout(()=>process.stdout.write('READY\\n'),20)});"
       ], options);
       return ssh;
     },
@@ -253,6 +406,33 @@ test("SSH output after startup does not send duplicate ready notifications", asy
   assert.equal(ready, 1);
 });
 
+test("existing-proxy mode forwards the configured port and leaves the external proxy running on shutdown", async (t) => {
+  const local = http.createServer((req, res) => res.end("external-proxy"));
+  await listen(local);
+  t.after(() => close(local));
+  const port = local.address().port;
+  const { broker } = await brokerFixture(t, {
+    localProxyPort: port,
+    sshFactory(command, args, options) {
+      assert.equal(args[args.indexOf("-R") + 1], `127.0.0.1:1080:127.0.0.1:${port}`);
+      return fakeSsh(command, args, options);
+    }
+  });
+  assert.equal(broker.proxyPort, port);
+  const client = await clientFor(broker);
+  t.after(() => client.destroy());
+  client.destroy();
+  await deadline(broker.closed);
+  const body = await new Promise((resolve, reject) => {
+    http.get({ host: "127.0.0.1", port, agent: false }, (res) => {
+      let text = "";
+      res.on("data", (data) => { text += data; });
+      res.on("end", () => resolve(text));
+    }).on("error", reject);
+  });
+  assert.equal(body, "external-proxy");
+});
+
 test("invalid or unavailable local proxy ports fail explicitly and release broker resources", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remote-proxy-upstream-test-"));
   t.after(() => fs.rmSync(dir, { recursive: true }));
@@ -278,7 +458,10 @@ function passwordSsh(command, args, options) {
   assert.equal(options.env.SSH_ASKPASS_REQUIRE, "force");
   return spawn(process.execPath, ["-e", `
     const {spawn}=require('node:child_process');
-    const helper=spawn(process.env.SSH_ASKPASS,[],{env:process.env});
+    const helper=process.platform==='win32'
+      ? spawn('"'+process.env.SSH_ASKPASS+'"',[],{env:process.env,shell:process.env.ComSpec})
+      : spawn(process.env.SSH_ASKPASS,[],{env:process.env});
+    helper.stderr.pipe(process.stderr);
     let reply='';
     helper.stdout.on('data',d=>reply+=d);
     helper.on('exit',code=>{
@@ -297,7 +480,8 @@ test("real askpass helper transports a password without putting it in files or l
   t.after(() => client.destroy());
   let buffer = "";
   let asked = 0;
-  await deadline(new Promise((resolve) => {
+  await deadline(new Promise((resolve, reject) => {
+    broker.closed.then(() => reject(new Error(messages.join("\n") || "Broker closed before authentication")));
     client.on("data", (data) => {
       buffer += data.toString();
       let index;
@@ -320,30 +504,35 @@ test("real askpass helper transports a password without putting it in files or l
   }
   client.destroy();
   await deadline(broker.closed);
-  assert.ok(!fs.existsSync(path.join(stateDir, "askpass.sh")));
+  assert.ok(!fs.existsSync(path.join(stateDir, process.platform === "win32" ? "askpass.cmd" : "askpass.sh")));
 });
 
-test("askpass cancellation stops SSH and does not request another password", async (t) => {
-  const { broker, messages } = await brokerFixture(t, {
-    sshFactory: passwordSsh, leaseMs: 3000, startupGraceMs: 1000
-  });
-  const client = await clientFor(broker);
-  t.after(() => client.destroy());
-  let buffer = "";
-  client.on("data", (data) => {
-    buffer += data.toString();
-    let index;
-    while ((index = buffer.indexOf("\n")) >= 0) {
-      const message = JSON.parse(buffer.slice(0, index));
-      buffer = buffer.slice(index + 1);
-      if (message.state === "password") {
-        client.write(JSON.stringify({ type: "password", id: message.id, value: null }) + "\n");
+for (const [reason, value] of [
+  ["cancellation", null], ["line feed", "line\nbreak"], ["carriage return", "line\rbreak"],
+  ["null byte", "null\0byte"], ["oversized password", "x".repeat(8193)]
+]) {
+  test(`askpass ${reason} stops SSH and does not request another password`, async (t) => {
+    const { broker, messages } = await brokerFixture(t, {
+      sshFactory: passwordSsh, leaseMs: 3000, startupGraceMs: 1000
+    });
+    const client = await clientFor(broker);
+    t.after(() => client.destroy());
+    let buffer = "";
+    client.on("data", (data) => {
+      buffer += data.toString();
+      let index;
+      while ((index = buffer.indexOf("\n")) >= 0) {
+        const message = JSON.parse(buffer.slice(0, index));
+        buffer = buffer.slice(index + 1);
+        if (message.state === "password") {
+          client.write(JSON.stringify({ type: "password", id: message.id, value }) + "\n");
+        }
       }
-    }
+    });
+    await deadline(broker.closed);
+    assert.ok(messages.some((message) => message.includes("Authentication cancelled")));
   });
-  await deadline(broker.closed);
-  assert.ok(messages.some((message) => message.includes("Authentication cancelled")));
-});
+}
 
 test("askpass endpoint rejects unauthenticated clients without prompting VS Code", async (t) => {
   let env;

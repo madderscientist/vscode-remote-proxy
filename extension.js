@@ -6,7 +6,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const net = require("node:net");
 const { fork } = require("node:child_process");
-const { endpoint, validHost } = require("./broker");
+const { endpoint, validHost, validPassword, BROKER_BUSY_EXIT_CODE } = require("./broker");
 const { configPath, readHosts } = require("./ssh-config");
 
 function sshHosts(authority) {
@@ -78,9 +78,13 @@ function activate(context) {
     return folders.map((folder) => folder.uri).find((uri) => uri.scheme === "vscode-remote")
       || (vscode.workspace.workspaceFile?.scheme === "vscode-remote" ? vscode.workspace.workspaceFile : undefined);
   };
-  const closeCurrent = () => {
-    if (current) current.destroy();
+  const closeCurrent = (reason) => {
+    const socket = current;
     current = undefined;
+    if (socket) {
+      log(`Releasing broker control channel: ${reason}`);
+      socket.destroy();
+    }
   };
   const sshConfigFile = () => {
     const custom = vscode.workspace.getConfiguration("remoteProxy").get("sshConfigFile", "");
@@ -122,9 +126,13 @@ function activate(context) {
   }
   async function connect(stateDir, options, mine) {
     const address = endpoint(stateDir);
-    const attempt = () => new Promise((resolve, reject) => {
+    const tryConnect = () => new Promise((resolve, reject) => {
       const socket = net.connect(address);
-      const fail = (error) => { socket.destroy(); reject(error); };
+      const fail = (error) => {
+        socket.destroy();
+        if (["ENOENT", "ECONNREFUSED"].includes(error.code)) resolve();
+        else reject(error);
+      };
       socket.once("error", fail);
       socket.once("connect", () => {
         socket.removeListener("error", fail);
@@ -132,43 +140,54 @@ function activate(context) {
         resolve(socket);
       });
     });
-    try {
-      return await attempt();
-    } catch (error) {
-      if (!["ENOENT", "ECONNREFUSED"].includes(error.code)) throw error;
-    }
-    fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const existing = await tryConnect();
+    if (existing) return existing;
     const logPath = path.join(stateDir, "broker.log");
-    const fd = fs.openSync(logPath, "a", 0o600);
     let child;
-    try {
-      child = fork(path.join(context.extensionPath, "broker.js"), [JSON.stringify(options)], {
-        execArgv: [],
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
-        stdio: ["ignore", fd, fd, "ipc"],
-        windowsHide: true
-      });
-    } finally {
-      fs.closeSync(fd);
-    }
-    child.on("error", report);
-    child.disconnect();
-    child.unref();
+    let childError;
+    let contended = false;
+    const locked = () => ["broker.lock", "broker-starting.lock"]
+      .some((name) => fs.existsSync(path.join(stateDir, name)));
     for (let n = 0; n < 100 && !disposed && mine === generation; n++) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      try {
-        return await attempt();
-      } catch (error) {
-        if (!["ENOENT", "ECONNREFUSED"].includes(error.code)) throw error;
+      if (childError) throw childError;
+      if (child && (child.exitCode !== null || child.signalCode !== null)) {
+        if (child.exitCode !== BROKER_BUSY_EXIT_CODE) {
+          throw new Error(`Local broker exited (${child.exitCode ?? child.signalCode}). See ${logPath}`);
+        }
+        // A retiring broker holds its lock until its SSH process exits.
+        contended = true;
+        child = undefined;
       }
+      if (!child && n % 5 === 0 && (!contended || !locked())) {
+        fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+        const fd = fs.openSync(logPath, "a", 0o600);
+        try {
+          child = fork(path.join(context.extensionPath, "broker.js"), [JSON.stringify(options)], {
+            execArgv: [],
+            env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+            stdio: ["ignore", fd, fd, "ipc"],
+            windowsHide: true
+          });
+        } finally {
+          fs.closeSync(fd);
+        }
+        child.once("error", (error) => { childError = error; });
+        child.disconnect();
+        child.unref();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (disposed || mine !== generation) break;
+      const socket = await tryConnect();
+      if (socket) return socket;
     }
-    throw new Error(`Cannot start the local broker. See ${logPath}`);
+    const detail = contended ? " Broker startup encountered a lock conflict." : "";
+    throw new Error(`Cannot start the local broker.${detail} See ${logPath}`);
   }
-  async function restart() {
+  async function restart(reason = "activation") {
     const mine = ++generation;
     paused = false;
     clearTimeout(timer);
-    closeCurrent();
+    closeCurrent(`restart (${reason})`);
     status.hide();
     if (!["ssh-remote", "dev-container"].includes(vscode.env.remoteName)) return;
     const uri = remoteUri();
@@ -203,6 +222,10 @@ function activate(context) {
     const key = crypto.createHash("sha256").update(JSON.stringify(connection)).digest("hex").slice(0, 24);
     const stateDir = path.join(context.globalStorageUri.fsPath, key);
     const options = { stateDir, ...connection };
+    let lastHeartbeat;
+    let probing = false;
+    const active = () => !disposed && mine === generation && !paused;
+    const heartbeatAge = () => lastHeartbeat === undefined ? "not sent" : `${Date.now() - lastHeartbeat}ms`;
     async function answerPassword(message, socket) {
       try {
         const value = await vscode.window.showInputBox({
@@ -210,8 +233,8 @@ function activate(context) {
           prompt: "Password for this proxy SSH connection (not saved). Cancel to stop; use Retry to try again.",
           password: true,
           ignoreFocusOut: true,
-          validateInput: (text) => /[\r\n\0]/.test(text) || text.length > 8192
-            ? "Password contains unsupported characters or is too long." : undefined
+          validateInput: (text) => validPassword(text)
+            ? undefined : "Password contains unsupported characters or is too long."
         });
         if (disposed || mine !== generation || socket.destroyed) return;
         if (value === undefined) paused = true;
@@ -222,20 +245,58 @@ function activate(context) {
         report(error);
       }
     }
-    async function tick() {
-      if (paused) return;
+    async function checkRemote() {
+      probing = true;
+      const started = Date.now();
+      const warning = setTimeout(() => {
+        if (active()) {
+          log(`Remote filesystem probe pending for ${Date.now() - started}ms; last heartbeat age=${heartbeatAge()}`);
+        }
+      }, 5000);
+      warning.unref();
       try {
-        // Successful remote I/O renews the lease; a disconnected window cannot keep it alive.
         await vscode.workspace.fs.stat(uri);
-        if (disposed || mine !== generation) return;
+      } finally {
+        probing = false;
+        clearTimeout(warning);
+        if (active() && Date.now() - started >= 2000) {
+          log(`Remote filesystem probe finished after ${Date.now() - started}ms; last heartbeat age=${heartbeatAge()}`);
+        }
+      }
+    }
+    function failLease(error) {
+      if (disposed || mine !== generation) return;
+      log(`Lease check failed; last heartbeat age=${heartbeatAge()}`);
+      if (current) {
+        paused = true;
+        clearTimeout(timer);
+        status.command = "remoteProxy.retry";
+      }
+      closeCurrent("lease check failed");
+      report(error);
+    }
+    async function tick() {
+      if (!active()) return;
+      try {
         if (!current || current.destroyed) {
+          await checkRemote();
+          if (!active()) return;
           status.text = "$(sync~spin) HTTP proxy";
-          const socket = await connect(stateDir, options, mine);
-          if (disposed || mine !== generation) {
+          let socket;
+          try {
+            socket = await connect(stateDir, options, mine);
+          } catch (error) {
+            if (disposed || mine !== generation) return;
+            paused = true;
+            status.command = "remoteProxy.retry";
+            throw error;
+          }
+          if (!active()) {
             socket.destroy();
             return;
           }
           current = socket;
+          log(`Broker control channel connected; generation=${mine}`);
           let buffer = "";
           socket.on("data", (data) => {
             buffer += data.toString();
@@ -266,6 +327,7 @@ function activate(context) {
           });
           socket.once("close", () => {
             if (current === socket) {
+              log(`Broker control channel closed; last heartbeat age=${heartbeatAge()}`);
               current = undefined;
               if (!disposed) {
                 paused = true;
@@ -275,14 +337,19 @@ function activate(context) {
               }
             }
           });
+        } else if (!probing) {
+          const socket = current;
+          // A slow remote filesystem is not evidence that the local window or proxy SSH disconnected.
+          void checkRemote().catch((error) => {
+            if (active() && current === socket) failLease(error);
+          });
         }
         current.write("ping\n");
+        lastHeartbeat = Date.now();
       } catch (error) {
-        if (disposed || mine !== generation) return;
-        closeCurrent();
-        report(error);
+        failLease(error);
       }
-      if (!disposed && mine === generation) timer = setTimeout(tick, 2000);
+      if (active()) timer = setTimeout(tick, 2000);
     }
     void tick();
   }
@@ -291,7 +358,7 @@ function activate(context) {
   );
   context.subscriptions.push(
     output, status,
-    command("retry", restart),
+    command("retry", () => restart("Retry command")),
     command("configure", configureHosts),
     command("disable", async () => {
       const uri = remoteUri();
@@ -330,13 +397,13 @@ function activate(context) {
         ...config.get("windowBindings", {}), [uri.authority]: host
       }, vscode.ConfigurationTarget.Global);
     }),
-    vscode.workspace.onDidChangeWorkspaceFolders(() => { void restart().catch(report); }),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => { void restart("workspace folders changed").catch(report); }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("remoteProxy") || event.affectsConfiguration("remote.SSH.configFile")) {
-        void restart().catch(report);
+        void restart("configuration changed").catch(report);
       }
     }),
-    { dispose() { disposed = true; generation++; clearTimeout(timer); closeCurrent(); } }
+    { dispose() { disposed = true; generation++; clearTimeout(timer); closeCurrent("window disposed"); } }
   );
   void restart().catch(report);
 }

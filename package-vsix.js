@@ -53,11 +53,23 @@ try {
 </PackageManifest>
 `);
   if (fs.existsSync(output)) fs.unlinkSync(output);
-  const result = spawnSync("zip", ["-q", "-r", output, "[Content_Types].xml", "extension.vsixmanifest", "extension"], {
-    cwd: staging, encoding: "utf8"
-  });
+  const result = process.platform === "win32"
+    ? spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+      "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; " +
+      "$zip = [System.IO.Compression.ZipFile]::Open($env:REMOTE_PROXY_VSIX_OUTPUT, 'Create'); " +
+      "try { [System.IO.Directory]::GetFiles($env:REMOTE_PROXY_VSIX_STAGING, '*', 'AllDirectories') | ForEach-Object { " +
+      "$name = $_.Substring($env:REMOTE_PROXY_VSIX_STAGING.Length + 1).Replace([char]92, [char]47); " +
+      "[System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $_, $name) | Out-Null " +
+      "} } finally { $zip.Dispose() }"
+    ], {
+      encoding: "utf8",
+      env: { ...process.env, REMOTE_PROXY_VSIX_STAGING: staging, REMOTE_PROXY_VSIX_OUTPUT: output }
+    })
+    : spawnSync("zip", ["-q", "-r", output, "[Content_Types].xml", "extension.vsixmanifest", "extension"], {
+      cwd: staging, encoding: "utf8"
+    });
   if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(result.stderr || `zip exited ${result.status}`);
+  if (result.status !== 0) throw new Error(result.stderr || `VSIX compression exited ${result.status}`);
   console.log(output);
 } finally {
   fs.rmSync(staging, { recursive: true });

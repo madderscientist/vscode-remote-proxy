@@ -7,8 +7,14 @@ const crypto = require("node:crypto");
 const http = require("node:http");
 const net = require("node:net");
 const { spawn } = require("node:child_process");
+const { once } = require("node:events");
 
 const READY = "REMOTE_PROXY_READY";
+const BROKER_BUSY_EXIT_CODE = 75;
+
+function reportBroker(message) {
+  console.error(`${new Date().toISOString()} [broker ${process.pid}] ${message}`);
+}
 
 function endpoint(stateDir) {
   const id = crypto.createHash("sha256").update(stateDir).digest("hex").slice(0, 24);
@@ -19,6 +25,10 @@ function endpoint(stateDir) {
 
 function validHost(host) {
   return typeof host === "string" && /^[\p{L}\p{N}_][\p{L}\p{M}\p{N}_.@:[\]-]*$/u.test(host);
+}
+
+function validPassword(value) {
+  return typeof value === "string" && value.length <= 8192 && !/[\r\n\0]/.test(value);
 }
 
 function forwardedHeaders(headers) {
@@ -90,7 +100,9 @@ function createProxy(report = () => {}) {
       return;
     }
     const host = target.hostname.replace(/^\[|\]$/g, "");
-    const upstream = track(net.connect({ host, port: Number(target.port || 443) }));
+    const port = Number(target.port || 443);
+    const started = Date.now();
+    const upstream = track(net.connect({ host, port }));
     let connected = false;
     const timer = setTimeout(() => upstream.destroy(new Error("CONNECT timed out")), 15000);
     upstream.once("connect", () => {
@@ -102,7 +114,8 @@ function createProxy(report = () => {}) {
       client.pipe(upstream);
     });
     upstream.on("error", (error) => {
-      report(`CONNECT failed: ${error.message}`);
+      report(`CONNECT failed: ${error.message}; target=${target.hostname}:${port}; ` +
+        `phase=${connected ? "tunnel" : "connect"}; elapsed=${Date.now() - started}ms; code=${error.code || "none"}`);
       if (!connected) client.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
       else client.destroy();
     });
@@ -141,7 +154,7 @@ async function startBroker(options) {
     stateDir, host, remotePort = 1080, sshPath = "ssh",
     leaseMs = 10000, startupGraceMs = 15000, sshFactory = spawn, authentication = "password", configFile,
     localProxyPort = 0,
-    report = (message) => console.error(message)
+    report = reportBroker
   } = options;
   if (!validHost(host)) throw new Error("Invalid SSH destination");
   if (!Number.isInteger(localProxyPort) || localProxyPort < 0 || localProxyPort > 65535) {
@@ -157,14 +170,20 @@ async function startBroker(options) {
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const lockPath = path.join(stateDir, "broker.lock");
   const guardPath = path.join(stateDir, "broker-starting.lock");
-  const guard = fs.openSync(guardPath, "wx", 0o600);
+  let guard;
+  try {
+    guard = fs.openSync(guardPath, "wx", 0o600);
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    throw Object.assign(new Error(`Another broker is starting: ${guardPath}`), { code: "EBROKERBUSY" });
+  }
   try {
     if (fs.existsSync(lockPath)) {
       const pid = Number(fs.readFileSync(lockPath, "utf8"));
       if (!Number.isInteger(pid) || pid <= 0) throw new Error(`Invalid broker lock: ${lockPath}`);
       try {
         process.kill(pid, 0);
-        throw new Error("Another broker is already running");
+        throw Object.assign(new Error(`Another broker is already running (PID ${pid})`), { code: "EBROKERBUSY" });
       } catch (probeError) {
         if (probeError.code !== "ESRCH") throw probeError;
       }
@@ -182,6 +201,7 @@ async function startBroker(options) {
   let ssh;
   let status = { state: "starting" };
   const clients = new Map();
+  let nextLeaseId = 0;
   let pendingPassword;
   const token = crypto.randomBytes(32).toString("hex");
   const askpassPath = path.join(stateDir, process.platform === "win32" ? "askpass.cmd" : "askpass.sh");
@@ -231,7 +251,9 @@ async function startBroker(options) {
   const control = net.createServer((socket) => {
     if (stopping) return socket.destroy();
     everConnected = true;
-    clients.set(socket, Date.now());
+    const lease = { id: ++nextLeaseId, lastPing: Date.now(), expired: false };
+    clients.set(socket, lease);
+    report(`Window lease ${lease.id} connected; windows=${clients.size}`);
     socket.write(`${JSON.stringify(status)}\n`);
     offerPassword();
     let buffer = "";
@@ -253,7 +275,7 @@ async function startBroker(options) {
           const pending = pendingPassword;
           pendingPassword = undefined;
           clearTimeout(pending.timer);
-          if (reply.value === null || /[\r\n\0]/.test(reply.value) || reply.value.length > 8192) {
+          if (!validPassword(reply.value)) {
             pending.res.writeHead(403).end();
             void stop(new Error("Authentication cancelled; use Retry to reconnect"));
           } else {
@@ -261,17 +283,18 @@ async function startBroker(options) {
           }
           continue;
         }
-        clients.set(socket, Date.now());
+        lease.lastPing = Date.now();
       }
     });
     socket.on("error", (error) => report(`Lease connection failed: ${error.message}`));
     socket.once("close", () => {
       clients.delete(socket);
+      report(`Window lease ${lease.id} closed; reason=${lease.expired ? "expired" : "control channel closed"}; windows=${clients.size}`);
       if (pendingPassword?.owner === socket) {
         pendingPassword.owner = undefined;
         offerPassword();
       }
-      if (!clients.size) void stop();
+      if (!clients.size) void stop(undefined, lease.expired ? "last window lease expired" : "last window disconnected");
     });
   });
   const cleanupFiles = () => {
@@ -284,9 +307,10 @@ async function startBroker(options) {
   let sweep;
   let startupTimer;
   let authenticationTimer;
-  async function stop(error) {
+  async function stop(error, reason = error ? "error" : "requested") {
     if (stopping) return closed;
     stopping = true;
+    report(`Stopping broker: ${reason}; windows=${clients.size}; SSH PID=${ssh?.pid ?? "none"}`);
     if (error) {
       report(error.message);
       notify({ state: "error", message: error.message });
@@ -328,25 +352,16 @@ async function startBroker(options) {
       if (!fs.lstatSync(address).isSocket()) throw new Error(`Not a socket: ${address}`);
       fs.unlinkSync(address);
     }
-    await new Promise((resolve, reject) => {
-      control.once("error", reject);
-      control.listen(address, resolve);
-    });
+    await once(control.listen(address), "listening");
     ownedSocket = true;
     if (process.platform !== "win32") fs.chmodSync(address, 0o600);
     if (proxy) {
-      await new Promise((resolve, reject) => {
-        proxy.server.once("error", reject);
-        proxy.server.listen(0, "127.0.0.1", resolve);
-      });
+      await once(proxy.server.listen(0, "127.0.0.1"), "listening");
     } else {
       await checkLocalProxy(localProxyPort);
     }
     const port = localProxyPort || proxy.server.address().port;
-    await new Promise((resolve, reject) => {
-      authServer.once("error", reject);
-      authServer.listen(0, "127.0.0.1", resolve);
-    });
+    await once(authServer.listen(0, "127.0.0.1"), "listening");
     fs.writeFileSync(askpassPath, process.platform === "win32"
       ? '@echo off\r\n"%REMOTE_PROXY_NODE%" "%REMOTE_PROXY_HELPER%"\r\n'
       : '#!/bin/sh\nexec "$REMOTE_PROXY_NODE" "$REMOTE_PROXY_HELPER"\n',
@@ -376,8 +391,9 @@ async function startBroker(options) {
     let output = "";
     let stderr = "";
     ssh.stdout.on("data", (data) => {
+      if (status.state === "ready") return;
       output = (output + data.toString()).slice(-4096);
-      if (status.state !== "ready" && output.split(/\r?\n/).includes(READY)) {
+      if (output.split(/\r?\n/).includes(READY)) {
         clearTimeout(authenticationTimer);
         notify({ state: "ready", host, remotePort });
       }
@@ -399,8 +415,12 @@ async function startBroker(options) {
     }, 135000);
     sweep = setInterval(() => {
       const now = Date.now();
-      for (const [socket, lastPing] of clients) {
-        if (now - lastPing > leaseMs) socket.destroy();
+      for (const [socket, lease] of clients) {
+        if (!socket.destroyed && now - lease.lastPing > leaseMs) {
+          lease.expired = true;
+          report(`Window lease ${lease.id} expired; heartbeat age=${now - lease.lastPing}ms; limit=${leaseMs}ms; windows=${clients.size}`);
+          socket.destroy();
+        }
       }
     }, Math.min(1000, leaseMs / 2));
     control.on("error", (error) => { void stop(error); });
@@ -413,17 +433,20 @@ async function startBroker(options) {
   return { address, closed, stop, proxyPort: localProxyPort || proxy.server.address()?.port };
 }
 
-module.exports = { createProxy, endpoint, startBroker, validHost };
+module.exports = { createProxy, endpoint, startBroker, validHost, validPassword, BROKER_BUSY_EXIT_CODE };
 
 if (require.main === module) {
   let broker;
-  const stop = () => { if (broker) void broker.stop(); };
-  process.on("SIGTERM", stop);
-  process.on("SIGINT", stop);
+  const stop = (signal) => { if (broker) void broker.stop(undefined, signal); };
+  process.on("SIGTERM", () => stop("signal SIGTERM"));
+  process.on("SIGINT", () => stop("signal SIGINT"));
+  reportBroker("Starting broker");
   startBroker(JSON.parse(process.argv[2])).then((value) => {
     broker = value;
+    reportBroker("Control channel listening");
+    void broker.closed.then(() => reportBroker("Stopped; SSH exited and broker resources released"));
   }).catch((error) => {
-    console.error(error.message);
-    process.exitCode = 1;
+    reportBroker(`${error.code ? `${error.code}: ` : ""}${error.message}`);
+    process.exitCode = error.code === "EBROKERBUSY" ? BROKER_BUSY_EXIT_CODE : 1;
   });
 }
