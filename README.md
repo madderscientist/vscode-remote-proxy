@@ -195,6 +195,9 @@ The extension reuses a running broker. During shutdown, its control channel
 closes before SSH exits and the lock is released. Startup waits for lock
 conflicts within a bounded 10-second window, checking for a broker started by
 another window without repeatedly launching children while the locks remain.
+Reusing a control channel requires a response from the broker, not just a
+successful socket connection; a shutdown reset before that response is retried
+within the same startup window.
 Other startup failures are reported promptly. A failure or timeout requires
 explicit **Retry connection**; rapid Retry cancels obsolete startup attempts.
 

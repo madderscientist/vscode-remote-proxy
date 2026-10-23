@@ -126,29 +126,45 @@ function activate(context) {
   }
   async function connect(stateDir, options, mine) {
     const address = endpoint(stateDir);
+    const logPath = path.join(stateDir, "broker.log");
+    const deadline = Date.now() + 10000;
     const tryConnect = () => new Promise((resolve, reject) => {
       const socket = net.connect(address);
+      const cleanup = () => {
+        clearTimeout(timeout);
+        socket.removeListener("error", fail);
+        socket.removeListener("close", closed);
+        socket.removeListener("readable", responding);
+      };
       const fail = (error) => {
+        cleanup();
         socket.destroy();
-        if (["ENOENT", "ECONNREFUSED"].includes(error.code)) resolve();
+        if (["ENOENT", "ECONNREFUSED", "ECONNRESET"].includes(error.code)) resolve();
         else reject(error);
       };
-      socket.once("error", fail);
-      socket.once("connect", () => {
-        socket.removeListener("error", fail);
+      const closed = () => { cleanup(); resolve(); };
+      const responding = () => {
+        if (!socket.readableLength) return;
+        cleanup();
         socket.on("error", report);
         resolve(socket);
-      });
+      };
+      const timeout = setTimeout(() => {
+        fail(new Error(`Local broker control channel did not respond. See ${logPath}`));
+      }, Math.max(0, deadline - Date.now()));
+      socket.once("error", fail);
+      socket.once("close", closed);
+      // A retiring Unix socket can connect successfully, then reset without accepting a lease.
+      socket.on("readable", responding);
     });
     const existing = await tryConnect();
     if (existing) return existing;
-    const logPath = path.join(stateDir, "broker.log");
     let child;
     let childError;
     let contended = false;
     const locked = () => ["broker.lock", "broker-starting.lock"]
       .some((name) => fs.existsSync(path.join(stateDir, name)));
-    for (let n = 0; n < 100 && !disposed && mine === generation; n++) {
+    for (let n = 0; n < 100 && Date.now() < deadline && !disposed && mine === generation; n++) {
       if (childError) throw childError;
       if (child && (child.exitCode !== null || child.signalCode !== null)) {
         if (child.exitCode !== BROKER_BUSY_EXIT_CODE) {
@@ -325,6 +341,7 @@ function activate(context) {
               }
             }
           });
+          socket.resume();
           socket.once("close", () => {
             if (current === socket) {
               log(`Broker control channel closed; last heartbeat age=${heartbeatAge()}`);

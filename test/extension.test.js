@@ -88,9 +88,17 @@ function fixture(remoteName, stat, settings = {}, password = "test-password", ex
       socket.destroyed = false;
       socket.messages = [];
       socket.write = (message) => { socket.messages.push(message); };
+      socket.resume = () => {};
       socket.destroy = () => { socket.destroyed = true; socket.emit("close"); };
       sockets.push(socket);
-      queueMicrotask(() => extras.connect ? extras.connect(socket) : socket.emit("connect"));
+      queueMicrotask(() => {
+        if (extras.connect) extras.connect(socket);
+        else socket.emit("connect");
+        if (!socket.destroyed && extras.respond !== false) {
+          socket.readableLength = 1;
+          socket.emit("readable");
+        }
+      });
       return socket;
     }
   };
@@ -233,6 +241,62 @@ test("unexpected control channel errors are reported without spawning a broker",
   assert.ok(f.sockets.every((socket) => socket.destroyed));
 });
 
+for (const outcome of ["reset", "close"]) {
+  test(`a broker that connects then ${outcome}s before responding is not reused`, async (t) => {
+    let probes = 0;
+    let launches = 0;
+    const f = fixture("ssh-remote", async () => ({}), {}, "unused", {
+      connect(socket) {
+        socket.emit("connect");
+        if (++probes === 1) {
+          if (outcome === "reset") socket.emit("error", Object.assign(new Error("Retiring broker"), { code: "ECONNRESET" }));
+          socket.destroy();
+        }
+      },
+      modules: {
+        "node:fs": { mkdirSync() {}, openSync() { return 1; }, closeSync() {} },
+        "node:child_process": {
+          fork() {
+            launches++;
+            const child = new EventEmitter();
+            child.exitCode = child.signalCode = null;
+            child.disconnect = child.unref = () => {};
+            return child;
+          }
+        }
+      }
+    });
+    t.after(() => f.dispose());
+    await waitFor(() => f.sockets.some((socket) => !socket.destroyed && socket.messages.includes("ping\n")));
+    assert.equal(launches, 1);
+    assert.equal(probes, 2);
+    assert.ok(!f.logs.some((line) => line.includes("Retiring broker")));
+  });
+}
+
+test("a connected but silent broker times out without spawning competing processes", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const f = fixture("ssh-remote", async () => ({}), {}, "unused", {
+    respond: false,
+    modules: {
+      "node:child_process": { fork() { assert.fail("Must not spawn alongside a silent control channel"); } }
+    }
+  });
+  t.after(() => f.dispose());
+  await settle();
+  t.mock.timers.tick(9999);
+  await settle();
+  assert.equal(f.logs.length, 0);
+  assert.equal(f.sockets[0].messages.length, 0);
+  t.mock.timers.tick(1);
+  await settle();
+  assert.ok(f.logs.some((line) => line.includes("control channel did not respond")));
+  assert.equal(f.sockets[0].destroyed, true);
+  t.mock.timers.tick(20000);
+  await settle();
+  assert.equal(f.sockets.length, 1, "A silent broker requires explicit Retry after timeout");
+});
+
 test("non-contention broker exits are reported promptly without launching another child", async (t) => {
   const f = startupFixture(t, 1);
   await waitFor(() => f.logs.some((message) => message.includes("Local broker exited (1)")));
@@ -361,7 +425,10 @@ test("real broker processes share a Windows pipe / Unix socket and reconnect dur
   finishProbe({});
   await settle();
   for (let i = 0; i < 8; i++) await next.commands["remoteProxy.retry"]();
-  await waitFor(() => next.logs.filter((line) => line.includes("Proxy ready")).length >= 2, 5000);
+  await waitFor(() => {
+    assert.ok(!next.logs.some((line) => line.includes("Broker control channel closed")), next.logs.join("\n"));
+    return next.logs.filter((line) => line.includes("Proxy ready")).length >= 2;
+  }, 5000);
 });
 
 test("encoded Chinese SSH aliases match the enabled alias array and acquire a lease", async () => {
